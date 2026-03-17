@@ -1,0 +1,237 @@
+"""Main FastAPI application."""
+
+import logging
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+from config.logging_config import setup_logging
+from config.settings import Config
+from src.api.middleware import (
+    add_cors_middleware,
+    add_exception_handlers,
+    limiter,
+    request_logging_middleware,
+)
+from src.database.connection import db_manager
+
+# Setup logging
+setup_logging()
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI(
+    title=Config.API_TITLE,
+    description=Config.API_DESCRIPTION,
+    version=Config.API_VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
+
+# Add middleware
+add_cors_middleware(app)
+
+# Add security headers middleware
+from src.security.headers import SecurityHeadersMiddleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Add advanced security middleware (rate limiting, threat detection, IP filtering)
+from src.security.middleware import AdvancedSecurityMiddleware
+app.add_middleware(AdvancedSecurityMiddleware)
+
+# Add tenant middleware for multi-tenant support
+from src.api.middleware.tenant_middleware import TenantMiddleware
+app.add_middleware(TenantMiddleware)
+
+# Add analytics middleware for API usage tracking
+from src.api.middleware.analytics_middleware import AnalyticsMiddleware
+app.add_middleware(AnalyticsMiddleware)
+
+app.middleware("http")(request_logging_middleware)
+app.state.limiter = limiter
+add_exception_handlers(app)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup."""
+    logger.info("Starting SoundHash API...")
+    db_manager.initialize()
+    logger.info("Database connection initialized")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown."""
+    logger.info("Shutting down SoundHash API...")
+
+
+@app.get("/")
+async def root():
+    """Root endpoint."""
+    return {
+        "name": Config.API_TITLE,
+        "version": Config.API_VERSION,
+        "status": "running",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    from sqlalchemy import text
+
+    try:
+        # Check database connection
+        session = db_manager.get_session()
+        session.execute(text("SELECT 1"))
+        session.close()
+        db_healthy = True
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        db_healthy = False
+
+    if db_healthy:
+        return {"status": "healthy", "database": "connected"}
+    else:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "database": "disconnected"},
+        )
+
+
+@app.get("/health/ready")
+async def readiness_check():
+    """
+    Readiness check endpoint for Kubernetes.
+    Returns 200 if the service is ready to accept traffic.
+    """
+    from sqlalchemy import text
+
+    try:
+        # Check database connection
+        session = db_manager.get_session()
+        session.execute(text("SELECT 1"))
+        session.close()
+        db_ready = True
+    except Exception as e:
+        logger.error(f"Readiness check - Database not ready: {e}")
+        db_ready = False
+
+    # Check Redis if enabled
+    redis_ready = True
+    if Config.REDIS_ENABLED:
+        try:
+            import redis
+            r = redis.Redis(
+                host=Config.REDIS_HOST,
+                port=Config.REDIS_PORT,
+                db=Config.REDIS_DB,
+                password=Config.REDIS_PASSWORD,
+                socket_connect_timeout=2
+            )
+            r.ping()
+            r.close()
+        except Exception as e:
+            logger.error(f"Readiness check - Redis not ready: {e}")
+            redis_ready = False
+
+    if db_ready and redis_ready:
+        return {"status": "ready", "database": "connected", "redis": "connected" if Config.REDIS_ENABLED else "disabled"}
+    else:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "database": "connected" if db_ready else "disconnected",
+                "redis": "connected" if redis_ready else "disconnected"
+            },
+        )
+
+
+# Import and include routers
+from src.api.routes import (
+    admin,
+    analytics,
+    auth,
+    billing,
+    channels,
+    compliance,
+    email,
+    fingerprints,
+    matches,
+    monetization,
+    monitoring,
+    onboarding,
+    security,
+    tenants,
+    videos,
+    webhooks,
+)
+
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
+app.include_router(videos.router, prefix="/api/v1/videos", tags=["Videos"])
+app.include_router(matches.router, prefix="/api/v1/matches", tags=["Matches"])
+app.include_router(channels.router, prefix="/api/v1/channels", tags=["Channels"])
+app.include_router(fingerprints.router, prefix="/api/v1/fingerprints", tags=["Fingerprints"])
+app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
+app.include_router(monitoring.router, prefix="/api/v1/monitoring", tags=["Monitoring"])
+app.include_router(email.router, prefix="/api/v1", tags=["Email"])
+app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["Tenants"])
+app.include_router(security.router, prefix="/api/v1/security", tags=["Security"])
+app.include_router(compliance.router, prefix="/api/v1/compliance", tags=["Compliance"])
+app.include_router(billing.router, prefix="/api/v1/billing", tags=["Billing"])
+app.include_router(onboarding.router, prefix="/api/v1/onboarding", tags=["Onboarding"])
+app.include_router(webhooks.router, prefix="/api/v1/webhooks", tags=["Webhooks"])
+app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
+app.include_router(monetization.router, prefix="/api/v1/monetization", tags=["Monetization"])
+
+
+# WebSocket endpoint for real-time audio streaming
+from fastapi import WebSocket, WebSocketDisconnect
+
+from src.api.websocket import manager
+from src.core.streaming_processor import cleanup_processor, process_audio_chunk
+
+
+@app.websocket("/ws/stream/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    """
+    WebSocket endpoint for real-time audio streaming.
+    
+    Clients connect with a unique client_id and stream audio data.
+    The server processes the audio in real-time and sends back match results.
+    """
+    await manager.connect(websocket, client_id)
+    await manager.send_status(client_id, "Connected to SoundHash streaming service")
+
+    try:
+        while True:
+            # Receive audio chunk
+            data = await websocket.receive_bytes()
+
+            # Process audio chunk
+            await process_audio_chunk(client_id, data)
+
+    except WebSocketDisconnect:
+        logger.info(f"Client {client_id} disconnected")
+        manager.disconnect(client_id)
+        cleanup_processor(client_id)
+    except Exception as e:
+        logger.error(f"WebSocket error for {client_id}: {e}")
+        manager.disconnect(client_id)
+        cleanup_processor(client_id)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "src.api.main:app",
+        host=Config.API_HOST,
+        port=Config.API_PORT,
+        reload=True,
+        log_config=None,  # Use our custom logging
+    )

@@ -1,0 +1,904 @@
+import os
+import random
+import subprocess
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from config.logging_config import create_section_logger
+from config.settings import Config
+
+if TYPE_CHECKING:
+    from src.api.youtube_service import YouTubeAPIService
+
+try:
+    from src.api.youtube_service import YouTubeAPIService as _YouTubeAPIService
+
+    YOUTUBE_API_AVAILABLE = True
+    YouTubeAPIService = _YouTubeAPIService  # type: ignore[misc,assignment]
+except ImportError:
+    YOUTUBE_API_AVAILABLE = False
+
+# Import alert manager if alerting is enabled
+if Config.ALERTING_ENABLED:
+    from src.observability.alerting import alert_manager
+else:
+    alert_manager = None  # type: ignore[assignment]
+
+
+class VideoProcessor:
+    """
+    Handles video download, audio extraction, and segmentation for audio fingerprinting.
+    Uses YouTube Data API for metadata when available, falls back to yt-dlp for audio download.
+    """
+
+    # Test URL for cookie validation (short video that's unlikely to be removed)
+    _COOKIE_TEST_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def __init__(
+    self,
+    temp_dir: str | None = None,
+        segment_length: int | None = None,
+        youtube_service: Any | None = None,
+    ) -> None:
+        """
+        Initialize VideoProcessor.
+
+        Args:
+            temp_dir: Directory for temporary files (uses Config.TEMP_DIR if None)
+            segment_length: Length of audio segments in seconds (uses Config.SEGMENT_LENGTH_SECONDS if None)
+            youtube_service: Optional YouTube API service instance
+        """
+        self.temp_dir = temp_dir or Config.TEMP_DIR
+        self.segment_length = segment_length or Config.SEGMENT_LENGTH_SECONDS
+        self.youtube_service = youtube_service
+
+        # Create temp directory if it doesn't exist
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+        # Create cache directory if caching is enabled
+        if Config.ENABLE_YT_DLP_CACHE:
+            os.makedirs(Config.YT_DLP_CACHE_DIR, exist_ok=True)
+
+        # Setup yt-dlp configuration for audio download fallback
+        self.ydl_opts: dict[str, Any] = {
+            "format": "bestaudio/best",
+            "outtmpl": f"{self.temp_dir}/%(id)s.%(ext)s",
+            "extractaudio": True,
+            "audioformat": "wav",
+            "audioquality": 0,
+        }
+        self.logger = create_section_logger(__name__)
+
+        # Cache browser cookie detection result
+        # Empty string means "checked but not available", None means "not checked yet"
+        self._cached_cookies_browser: str | None = None
+
+        # Try to initialize YouTube API service if not provided
+        if not self.youtube_service and YOUTUBE_API_AVAILABLE:
+            try:
+                self.youtube_service = YouTubeAPIService()  # type: ignore[misc]
+                self.logger.info("YouTube Data API service initialized")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize YouTube API service: {e}")
+                self.logger.info("Will fall back to yt-dlp for all operations")
+
+    def _detect_browser_cookies(self) -> str | None:
+        """
+        Detect and cache which browser cookies are available.
+        Returns browser name ('chrome', 'chromium', 'firefox') or None if unavailable.
+        This method is called once and cached to avoid repeated filesystem checks.
+        """
+        # Use cached result if already checked (empty string means "checked but unavailable")
+        if self._cached_cookies_browser is not None:
+            return self._cached_cookies_browser if self._cached_cookies_browser else None
+
+        home = Path.home()
+
+        # Note: Browser paths are Linux-specific. Windows/macOS detection not implemented
+        # as this is intended for Linux deployment environments.
+
+        # Test Chrome/Chromium cookies first (check if browser data directory exists)
+        chrome_browsers = [
+            (home / ".config/google-chrome", "chrome"),
+            (home / ".config/chromium", "chromium"),
+        ]
+        for browser_path, browser_name in chrome_browsers:
+            if browser_path.exists():
+                try:
+                    test_cmd = [
+                        "yt-dlp",
+                        "--cookies-from-browser",
+                        browser_name,
+                        "--simulate",
+                        "--quiet",
+                        self._COOKIE_TEST_URL,
+                    ]
+                    result = subprocess.run(test_cmd, capture_output=True, timeout=5)
+                    if result.returncode == 0:
+                        self._cached_cookies_browser = browser_name
+                        return browser_name
+                except subprocess.TimeoutExpired:
+                    self.logger.debug(f"{browser_name} cookie test timed out")
+                except Exception:
+                    pass
+                break
+
+        # Try Firefox if Chrome/Chromium not available or failed
+        firefox_paths = [
+            home / ".mozilla/firefox",
+            home / "snap/firefox/common/.mozilla/firefox",
+            home / ".var/app/org.mozilla.firefox/.mozilla/firefox",
+        ]
+        for firefox_path in firefox_paths:
+            if firefox_path.exists():
+                try:
+                    test_cmd = [
+                        "yt-dlp",
+                        "--cookies-from-browser",
+                        "firefox",
+                        "--simulate",
+                        "--quiet",
+                        self._COOKIE_TEST_URL,
+                    ]
+                    result = subprocess.run(test_cmd, capture_output=True, timeout=5)
+                    if result.returncode == 0:
+                        self._cached_cookies_browser = "firefox"
+                        return "firefox"
+                except subprocess.TimeoutExpired:
+                    self.logger.debug("Firefox cookie test timed out")
+                except Exception:
+                    pass
+                break
+
+        # No browser cookies available - cache empty string to indicate "checked but unavailable"
+        self.logger.debug("No browser cookies available or accessible")
+        self._cached_cookies_browser = ""
+        return None
+
+    def _parse_video_info_output(self, output: str) -> dict[str, Any] | None:
+        """
+        Parse yt-dlp video info output in pipe-delimited format.
+        
+        Args:
+            output: Pipe-delimited string from yt-dlp in format:
+                   id|title|description|duration|upload_date|view_count|like_count|channel|channel_id|thumbnail|webpage_url
+        
+        Returns:
+            Dictionary with parsed video information, or None if output is empty/invalid.
+            Fields with value "NA" are converted to None.
+        """
+        if not output.strip():
+            return None
+        
+        parts = output.strip().split("|")
+        if len(parts) < 11:
+            return None
+        
+        return {
+            "id": parts[0] if parts[0] != "NA" else None,
+            "title": parts[1] if parts[1] != "NA" else None,
+            "description": parts[2] if parts[2] != "NA" else None,
+            "duration": (
+                int(parts[3]) if parts[3] != "NA" and parts[3].isdigit() else None
+            ),
+            "upload_date": parts[4] if parts[4] != "NA" else None,
+            "view_count": (
+                int(parts[5]) if parts[5] != "NA" and parts[5].isdigit() else None
+            ),
+            "like_count": (
+                int(parts[6]) if parts[6] != "NA" and parts[6].isdigit() else None
+            ),
+            "channel": parts[7] if parts[7] != "NA" else None,
+            "channel_id": parts[8] if parts[8] != "NA" else None,
+            "thumbnail": parts[9] if parts[9] != "NA" else None,
+            "webpage_url": parts[10] if parts[10] != "NA" else None,
+        }
+
+    def download_video_info(self, url: str) -> dict[str, Any] | None:
+        """
+        Extract video metadata without downloading using enhanced subprocess approach.
+        Returns video information dictionary.
+        """
+        try:
+            # Enhanced command with anti-detection measures
+            cmd = [
+                "yt-dlp",
+                "--print",
+                "%(id)s|%(title)s|%(description)s|%(duration)s|%(upload_date)s|%(view_count)s|%(like_count)s|%(channel)s|%(channel_id)s|%(thumbnail)s|%(webpage_url)s",
+                "--no-playlist",
+                "--user-agent",
+                self._get_random_user_agent(),
+                "--sleep-interval",
+                "1",
+                "--extractor-retries",
+                "2",
+            ]
+
+            # Add cache directory if caching is enabled
+            if Config.ENABLE_YT_DLP_CACHE:
+                cmd.extend(["--cache-dir", Config.YT_DLP_CACHE_DIR])
+
+            # Add proxy if configured
+            if Config.USE_PROXY and (Config.PROXY_URL or Config.PROXY_LIST):
+                proxy = self._get_proxy()
+                if proxy:
+                    cmd.extend(["--proxy", proxy])
+
+            # Use cached browser cookie detection
+            browser = self._detect_browser_cookies()
+            if browser:
+                cmd.extend(["--cookies-from-browser", browser])
+
+            cmd.append(url)
+
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
+
+            # Parse the output using helper method
+            return self._parse_video_info_output(result.stdout)
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"yt-dlp command failed for {url}: {e}")
+            if e.stderr:
+                self.logger.error(f"yt-dlp stderr: {e.stderr}")
+            return None
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"yt-dlp command timed out for {url}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting video info from {url}: {str(e)}")
+            return None
+
+    def download_video_audio(self, url: str, max_retries: int = 3) -> str | None:
+        """
+        Download video and extract audio with enhanced anti-detection measures.
+        Downloads audio in best available format, then converts to WAV separately.
+        Returns path to the extracted audio file.
+        """
+        # Extract video ID from URL
+        video_id = url.split("v=")[-1].split("&")[0] if "v=" in url else url.split("/")[-1]
+        wav_file = Path(self.temp_dir) / f"{video_id}.wav"
+
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(
+                    f"Downloading audio from: {url} (attempt {attempt + 1}/{max_retries})"
+                )
+
+                # Add random delay between attempts to avoid rate limiting
+                if attempt > 0:
+                    delay = random.uniform(5, 15) + (attempt * 2)  # Exponential backoff with jitter
+                    self.logger.info(f"Waiting {delay:.1f} seconds before retry...")
+                    time.sleep(delay)
+
+                downloaded_file = Path(self.temp_dir) / f"{video_id}.%(ext)s"
+
+                # Enhanced yt-dlp command with anti-detection measures
+                cmd = [
+                    "yt-dlp",
+                    "-f",
+                    "bestaudio",  # best audio format available
+                    "-o",
+                    str(downloaded_file),  # output template
+                    "--user-agent",
+                    self._get_random_user_agent(),  # Random user agent
+                    "--sleep-interval",
+                    "1",  # Sleep between downloads
+                    "--max-sleep-interval",
+                    "3",  # Maximum sleep interval
+                    "--extractor-retries",
+                    "3",  # Retry extraction on failure
+                    "--fragment-retries",
+                    "3",  # Retry fragments on failure
+                    "--retry-sleep",
+                    "exp=1:5",  # Exponential backoff for retries
+                ]
+
+                # Add cache directory if caching is enabled
+                if Config.ENABLE_YT_DLP_CACHE:
+                    cmd.extend(["--cache-dir", Config.YT_DLP_CACHE_DIR])
+
+                # Add proxy if configured
+                if Config.USE_PROXY and (Config.PROXY_URL or Config.PROXY_LIST):
+                    proxy = self._get_proxy()
+                    if proxy:
+                        cmd.extend(["--proxy", proxy])
+                        self.logger.debug(f"Using proxy: {proxy}")
+
+                # Configure extractor args and cookies (settings-driven > cookies file > auto-detect)
+                if Config.YT_PLAYER_CLIENT:
+                    cmd.extend(
+                        ["--extractor-args", f"youtube:player_client={Config.YT_PLAYER_CLIENT}"]
+                    )
+
+                cookies_configured = False
+
+                # Use explicit cookies file if provided
+                if getattr(Config, "YT_COOKIES_FILE", None) and os.path.exists(
+                    str(Config.YT_COOKIES_FILE)
+                ):
+                    cmd.extend(["--cookies", str(Config.YT_COOKIES_FILE)])
+                    cookies_configured = True
+                    self.logger.debug(f"Using cookies file: {Config.YT_COOKIES_FILE}")
+
+                # Use explicit cookies-from-browser if provided
+                elif getattr(Config, "YT_COOKIES_FROM_BROWSER", None):
+                    browser_arg = str(Config.YT_COOKIES_FROM_BROWSER)
+                    if getattr(Config, "YT_BROWSER_PROFILE", None):
+                        browser_arg = (
+                            f"{Config.YT_COOKIES_FROM_BROWSER}:{Config.YT_BROWSER_PROFILE}"
+                        )
+                    cmd.extend(["--cookies-from-browser", browser_arg])
+                    cookies_configured = True
+                    self.logger.debug(f"Using cookies from browser: {browser_arg}")
+
+                # Fallback auto-detection of available browsers
+                if not cookies_configured:
+                    try:
+                        for browser in ["chrome", "chromium", "brave", "edge", "firefox"]:
+                            test_cmd = [
+                                "yt-dlp",
+                                "--cookies-from-browser",
+                                browser,
+                                "--simulate",
+                                "--quiet",
+                                url,
+                            ]
+                            test_result = subprocess.run(test_cmd, capture_output=True, timeout=5)
+                            if test_result.returncode == 0:
+                                cmd.extend(["--cookies-from-browser", browser])
+                                self.logger.debug(f"Using {browser} cookies (auto)")
+                                cookies_configured = True
+                                break
+                    except Exception:
+                        self.logger.debug("Auto-detect cookies-from-browser failed")
+
+                # Append URL last
+                cmd.append(url)
+
+                self.logger.debug(
+                    f"Running yt-dlp command: {' '.join(cmd[:8])}..."
+                )  # Don't log full command with user agent
+                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+
+                # Find the actual downloaded file
+                actual_file = None
+                for file_path in Path(self.temp_dir).glob(f"{video_id}.*"):
+                    if file_path.suffix.lower() in [
+                        ".webm",
+                        ".m4a",
+                        ".mp3",
+                        ".opus",
+                        ".aac",
+                        ".mp4",
+                    ]:
+                        actual_file = file_path
+                        break
+
+                if not actual_file or not actual_file.exists():
+                    self.logger.error(f"Downloaded audio file not found in: {self.temp_dir}")
+                    if attempt < max_retries - 1:
+                        continue
+                    return None
+
+                self.logger.info(f"Downloaded audio file: {actual_file}")
+
+                # Convert to WAV using ffmpeg
+                self.logger.info(f"Converting to WAV: {wav_file}")
+                self._convert_to_wav(str(actual_file), str(wav_file))
+
+                # Clean up original downloaded file
+                actual_file.unlink()
+
+                if wav_file.exists():
+                    self.logger.info(f"Successfully processed audio: {wav_file}")
+                    return str(wav_file)
+                else:
+                    self.logger.error(f"WAV conversion failed: {wav_file}")
+                    if attempt < max_retries - 1:
+                        continue
+                    return None
+
+            except subprocess.CalledProcessError as e:
+                self.logger.error(f"yt-dlp command failed (attempt {attempt + 1}): {e}")
+                err_text = ""
+                if e.stderr:
+                    self.logger.error(f"yt-dlp stderr: {e.stderr}")
+                    err_text = (
+                        e.stderr
+                        if isinstance(e.stderr, str)
+                        else e.stderr.decode("utf-8", errors="ignore")
+                    )
+                    if "Sign in to confirm you’re not a bot" in err_text or "not a bot" in err_text:
+                        self.logger.error(
+                            "YouTube requested sign-in to confirm you're not a bot. Remediation options: "
+                            "1) Set YT_COOKIES_FILE in .env to a Netscape cookies.txt exported from your browser; "
+                            "2) Set YT_COOKIES_FROM_BROWSER (e.g., chrome|chromium|firefox) and optionally YT_BROWSER_PROFILE; "
+                            "3) Configure a proxy via USE_PROXY/PROXY_URL; 4) Retry later."
+                        )
+                if e.stdout:
+                    self.logger.error(f"yt-dlp stdout: {e.stdout}")
+
+                # Detect specific error types and provide targeted remediation
+                should_retry = attempt < max_retries - 1
+
+                # HTTP 403 Forbidden - Usually geo-restriction, age-restriction, or bot detection
+                if "403" in err_text or "Forbidden" in err_text:
+                    self.logger.error(
+                        "HTTP 403 Forbidden - Video may be geo-restricted, age-restricted, or YouTube detected automation. "
+                        "Remediation: 1) Use authenticated cookies (YT_COOKIES_FILE or YT_COOKIES_FROM_BROWSER); "
+                        "2) Configure proxy (USE_PROXY=true, PROXY_URL=...); "
+                        "3) Try different player client (YT_PLAYER_CLIENT=android); "
+                        "4) Verify video is accessible in your browser."
+                    )
+                    # Record alert for 403 errors
+                    if alert_manager:
+                        alert_manager.record_rate_limit_failure("403", url, err_text[:200])
+                    if should_retry:
+                        self.logger.info("Retrying with exponential backoff...")
+                        continue
+
+                # HTTP 429 Too Many Requests - Rate limiting
+                elif "429" in err_text or "Too Many Requests" in err_text:
+                    self.logger.error(
+                        "HTTP 429 Too Many Requests - YouTube rate limit exceeded. "
+                        "Remediation: 1) Reduce concurrent downloads; "
+                        "2) Use authenticated cookies (YT_COOKIES_FROM_BROWSER=chrome); "
+                        "3) Configure proxy rotation (PROXY_LIST=proxy1,proxy2,...); "
+                        "4) Wait before retrying (system will auto-retry with backoff)."
+                    )
+                    # Record alert for 429 errors
+                    if alert_manager:
+                        alert_manager.record_rate_limit_failure("429", url, err_text[:200])
+                    if should_retry:
+                        # Longer backoff for rate limits
+                        extra_delay = random.uniform(10, 30)
+                        self.logger.info(f"Rate limited - waiting extra {extra_delay:.1f}s before retry...")
+                        time.sleep(extra_delay)
+                        continue
+
+                # HTTP 410 Gone - Video deleted or unavailable
+                elif "410" in err_text or "Gone" in err_text or "has been removed" in err_text:
+                    self.logger.error(
+                        "HTTP 410 Gone - Video has been removed or is no longer available. "
+                        "This is permanent and cannot be remediated. Skipping video."
+                    )
+                    return None  # No point retrying a deleted video
+
+                # Bot detection / Sign-in required
+                elif "Sign in to confirm you're not a bot" in err_text or "not a bot" in err_text:
+                    self.logger.error(
+                        "YouTube bot detection - Sign-in required. "
+                        "Remediation: 1) Set YT_COOKIES_FILE in .env to a Netscape cookies.txt exported from your browser; "
+                        "2) Set YT_COOKIES_FROM_BROWSER (e.g., chrome|chromium|firefox) and optionally YT_BROWSER_PROFILE; "
+                        "3) Configure a proxy via USE_PROXY/PROXY_URL; "
+                        "4) Update yt-dlp (pip install --upgrade yt-dlp)."
+                    )
+                    if should_retry:
+                        continue
+
+                # Generic retry for other errors
+                elif should_retry:
+                    self.logger.info("Retrying after error...")
+                    continue
+
+                # Final attempt failed
+                if attempt == max_retries - 1:
+                    return None
+
+            except subprocess.TimeoutExpired:
+                self.logger.error(f"yt-dlp command timed out (attempt {attempt + 1})")
+                if attempt < max_retries - 1:
+                    continue
+                return None
+
+            except Exception as e:
+                self.logger.error(
+                    f"Error downloading video {url} (attempt {attempt + 1}): {str(e)}"
+                )
+                if attempt < max_retries - 1:
+                    continue
+                return None
+
+        return None
+
+    def _get_random_user_agent(self) -> str:
+        """Get a random user agent to avoid detection"""
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ]
+        return random.choice(user_agents)
+
+    def _get_proxy(self) -> str | None:
+        """Get a proxy URL if configured"""
+        if Config.PROXY_URL:
+            return Config.PROXY_URL
+        elif Config.PROXY_LIST:
+            # Filter out empty strings
+            valid_proxies = [p.strip() for p in Config.PROXY_LIST if p.strip()]
+            if valid_proxies:
+                return random.choice(valid_proxies)
+        return None
+
+    def _convert_to_wav(self, input_file: str, output_file: str) -> None:
+        """Convert audio file to WAV format using ffmpeg"""
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    input_file,
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    str(Config.FINGERPRINT_SAMPLE_RATE),
+                    "-ac",
+                    "1",  # Mono
+                    "-y",  # Overwrite output file
+                    output_file,
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Error converting {input_file} to WAV: {e}")
+            raise
+
+    def segment_audio(
+        self, audio_file: str, segment_length: int | None = None
+    ) -> list[tuple[str, float, float]]:
+        """
+        Split audio file into segments for processing.
+        Returns list of (segment_file_path, start_time, end_time) tuples.
+
+        Logs progress per segment including count and durations.
+        """
+        if not os.path.exists(audio_file):
+            raise FileNotFoundError(f"Audio file not found: {audio_file}")
+
+        segment_length = segment_length or self.segment_length
+        segments: list[tuple[str, float, float]] = []
+
+        try:
+            # Get audio duration using ffprobe
+            duration = self._get_audio_duration(audio_file)
+            if duration is None:
+                self.logger.error(f"Could not determine duration of {audio_file}")
+                return []
+
+            self.logger.info(f"Segmenting audio file (duration: {duration:.2f}s, segment length: {segment_length}s)")
+
+            # Create segments with unique prefix using timestamp
+            import time
+            unique_prefix = f"{Path(audio_file).stem}_{int(time.time() * 1000)}"
+
+            start_time: float = 0.0
+            segment_id = 0
+
+            while start_time < duration:
+                end_time = min(start_time + segment_length, duration)
+                actual_duration = end_time - start_time
+
+                # Create segment file path with unique prefix
+                segment_file = os.path.join(
+                    self.temp_dir,
+                    f"{unique_prefix}_segment_{segment_id:04d}.wav"
+                )
+
+                # Extract segment using ffmpeg
+                success = self._extract_audio_segment(
+                    audio_file, segment_file, start_time, actual_duration
+                )
+
+                if success:
+                    segments.append((segment_file, start_time, end_time))
+                    self.logger.debug(
+                        f"Created segment {segment_id + 1}: {start_time:.2f}s - {end_time:.2f}s "
+                        f"(duration: {actual_duration:.2f}s)"
+                    )
+                    segment_id += 1
+                else:
+                    self.logger.warning(
+                        f"Failed to extract segment {start_time:.2f}s - {end_time:.2f}s from {audio_file}"
+                    )
+
+                start_time = end_time
+
+            # Log final summary with handling for off-by-one at tail
+            total_expected = int(duration / segment_length) + (1 if duration % segment_length > 0 else 0)
+            self.logger.info(
+                f"Created {len(segments)} segment(s) from {audio_file} "
+                f"(expected: {total_expected}, total duration: {duration:.2f}s)"
+            )
+
+            return segments
+
+        except Exception as e:
+            self.logger.error(f"Error segmenting audio file {audio_file}: {str(e)}")
+            return []
+
+    def _get_audio_duration(self, audio_file: str) -> float | None:
+        """Get audio duration in seconds using ffprobe"""
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    audio_file,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            return float(result.stdout.strip())
+        except (subprocess.CalledProcessError, ValueError) as e:
+            self.logger.error(f"Error getting duration of {audio_file}: {e}")
+            return None
+
+    def _extract_audio_segment(
+        self, input_file: str, output_file: str, start_time: float, duration: float
+    ) -> bool:
+        """Extract a segment from audio file using ffmpeg"""
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    input_file,
+                    "-ss",
+                    str(start_time),
+                    "-t",
+                    str(duration),
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    str(Config.FINGERPRINT_SAMPLE_RATE),
+                    "-ac",
+                    "1",  # Mono
+                    "-y",  # Overwrite output file
+                    output_file,
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            return os.path.exists(output_file)
+
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Error extracting segment: {e}")
+            return False
+
+    def cleanup_temp_files(self, file_pattern: str | None = None) -> None:
+        """Clean up temporary files"""
+        try:
+            if file_pattern:
+                # Clean specific pattern
+                for file_path in Path(self.temp_dir).glob(file_pattern):
+                    file_path.unlink()
+            else:
+                # Clean all files in temp directory
+                for file_path in Path(self.temp_dir).iterdir():
+                    if file_path.is_file():
+                        file_path.unlink()
+
+            self.logger.info(f"Cleaned up temporary files: {file_pattern or 'all'}")
+
+        except Exception as e:
+            self.logger.error(f"Error cleaning up temp files: {str(e)}")
+
+    def get_channel_videos(
+        self, channel_id: str, max_results: int | None = None
+    ) -> list[dict[str, Any]]:
+        """
+        Get list of videos from a YouTube channel using Data API when available,
+        fallback to yt-dlp subprocess approach.
+        Returns list of video information dictionaries.
+        """
+        # Try YouTube Data API first
+        if self.youtube_service:
+            try:
+                videos = self.youtube_service.get_channel_videos(channel_id, max_results)
+                if videos:
+                    self.logger.info(
+                        f"Retrieved {len(videos)} videos via YouTube Data API for channel {channel_id}"
+                    )
+                    return videos
+            except Exception as e:
+                self.logger.warning(f"YouTube Data API failed for channel {channel_id}: {e}")
+
+        # Fallback to yt-dlp subprocess
+        return self._get_channel_videos_ytdlp(channel_id, max_results)
+
+    def process_video_for_fingerprinting(
+        self, video_url: str, cleanup_segments: bool | None = None
+    ) -> list[tuple[str, float, float]] | None:
+        """
+        Complete pipeline: download video, extract audio, and create segments.
+        Returns list of (segment_file, start_time, end_time) or None if failed.
+
+        Args:
+            video_url: URL of the video to process
+            cleanup_segments: Whether to clean up segment files after processing.
+                             If None, uses Config.CLEANUP_SEGMENTS_AFTER_PROCESSING
+        """
+        audio_file = None
+        segments = []
+
+        try:
+            # Download audio
+            audio_file = self.download_video_audio(video_url)
+            if not audio_file:
+                return None
+
+            # Segment audio
+            segments = self.segment_audio(audio_file)
+
+            if not segments:
+                return None
+
+            # This is where fingerprinting would happen - for now just return the segments
+            # In a real implementation, you'd process each segment for fingerprinting here
+            self.logger.info(f"Created {len(segments)} segments for fingerprinting")
+
+            # Clean up original audio based on configuration
+            if not Config.KEEP_ORIGINAL_AUDIO and audio_file and os.path.exists(audio_file):
+                os.remove(audio_file)
+                self.logger.info(f"Removed original audio file: {audio_file}")
+
+            return segments
+
+        except Exception as e:
+            self.logger.error(f"Error processing video {video_url}: {str(e)}")
+
+            # Clean up on error - remove audio file
+            if audio_file and os.path.exists(audio_file):
+                try:
+                    os.remove(audio_file)
+                    self.logger.debug(f"Cleaned up audio file on error: {audio_file}")
+                except Exception as cleanup_error:
+                    self.logger.warning(f"Failed to clean up audio file: {cleanup_error}")
+
+            # Clean up on error - remove segment files
+            for segment_file, _, _ in segments:
+                if os.path.exists(segment_file):
+                    try:
+                        os.remove(segment_file)
+                        self.logger.debug(f"Cleaned up segment on error: {segment_file}")
+                    except Exception as cleanup_error:
+                        self.logger.warning(f"Failed to clean up segment: {cleanup_error}")
+
+            return None
+
+    def cleanup_segments(self, segments: list[tuple[str, float, float]]) -> None:
+        """
+        Clean up segment files after processing.
+
+        Args:
+            segments: List of (segment_file, start_time, end_time) tuples
+        """
+        if not segments:
+            return
+
+        try:
+            removed_count = 0
+            for segment_file, _, _ in segments:
+                if os.path.exists(segment_file):
+                    try:
+                        os.remove(segment_file)
+                        removed_count += 1
+                        self.logger.debug(f"Removed segment file: {segment_file}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to remove segment {segment_file}: {e}")
+
+            self.logger.info(f"Cleaned up {removed_count}/{len(segments)} segment files")
+
+        except Exception as e:
+            self.logger.error(f"Error cleaning up segment files: {str(e)}")
+
+    def _extract_video_id(self, url: str) -> str | None:
+        """Extract YouTube video ID from URL"""
+        try:
+            if "v=" in url:
+                return url.split("v=")[1].split("&")[0]
+            elif "youtu.be/" in url:
+                return url.split("youtu.be/")[1].split("?")[0]
+            elif "/embed/" in url:
+                return url.split("/embed/")[1].split("?")[0]
+            return None
+        except:
+            return None
+
+    def _download_video_info_ytdlp(self, url: str) -> dict[str, Any] | None:
+        """Fallback method using yt-dlp subprocess for video info"""
+        try:
+            # Use subprocess to get video info with cookies from browser to avoid bot detection
+            cmd = [
+                "yt-dlp",
+                "--print",
+                "%(id)s|%(title)s|%(description)s|%(duration)s|%(upload_date)s|%(view_count)s|%(like_count)s|%(channel)s|%(channel_id)s|%(thumbnail)s|%(webpage_url)s",
+                "--no-playlist",
+            ]
+
+            # Use cached browser cookie detection
+            browser = self._detect_browser_cookies()
+            if browser:
+                cmd.extend(["--cookies-from-browser", browser])
+
+            cmd.append(url)
+
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
+
+            # Parse the output using helper method
+            return self._parse_video_info_output(result.stdout)
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"yt-dlp command failed for {url}: {e}")
+            if e.stderr:
+                self.logger.error(f"yt-dlp stderr: {e.stderr}")
+            return None
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"yt-dlp command timed out for {url}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting video info from {url}: {str(e)}")
+            return None
+
+    def _get_channel_videos_ytdlp(
+        self, channel_id: str, max_results: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Fallback method using yt-dlp subprocess for channel videos"""
+        try:
+            channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+
+            # Use simple subprocess approach with browser cookies to avoid bot detection
+            self.logger.info(f"Getting videos from channel: {channel_url}")
+
+            cmd = ["yt-dlp", "--flat-playlist", "--print", "%(id)s"]
+
+            # Only add playlist-end if we have a limit
+            if max_results is not None and max_results != float("inf"):
+                cmd.extend(["--playlist-end", str(max_results)])
+
+            # Use cached browser cookie detection
+            browser = self._detect_browser_cookies()
+            if browser:
+                cmd.extend(["--cookies-from-browser", browser])
+
+            cmd.append(channel_url)
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
+
+            video_ids = result.stdout.strip().split("\n") if result.stdout.strip() else []
+            self.logger.info(f"Found {len(video_ids)} video IDs for channel {channel_id}")
+
+            # Get video info for each ID
+            videos = []
+            for video_id in video_ids:
+                if video_id:
+                    video_url = f"https://www.youtube.com/watch?v={video_id}"
+                    video_info = self.download_video_info(video_url)
+                    if video_info:
+                        videos.append(video_info)
+
+            self.logger.info(
+                f"Successfully processed {len(videos)} videos for channel {channel_id}"
+            )
+            return videos
+
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"yt-dlp command failed for channel {channel_id}: {e}")
+            if e.stderr:
+                self.logger.error(f"yt-dlp stderr: {e.stderr}")
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting videos for channel {channel_id}: {str(e)}")
+            return []

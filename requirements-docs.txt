@@ -1,0 +1,17 @@
+# ⚠️ DEPRECATED: Documentation dependencies have been migrated to pyproject.toml
+#
+# Please install dependencies using:
+#   pip install -e .[docs]
+#
+# This file is kept for backwards compatibility and will be removed in a future release.
+# See pyproject.toml [project.optional-dependencies.docs] for the current dependency list.
+
+# Documentation dependencies
+mkdocs==1.6.1
+mkdocs-material==9.5.47
+mkdocs-gen-files==0.5.0
+mkdocs-literate-nav==0.6.1
+mkdocs-section-index==0.3.9
+pymdown-extensions==10.12
+mkdocs-swagger-ui-tag==0.6.10
+mkdocs-mermaid2-plugin==1.1.1

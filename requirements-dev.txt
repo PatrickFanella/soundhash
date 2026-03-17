@@ -1,0 +1,20 @@
+# ⚠️ DEPRECATED: Development dependencies have been migrated to pyproject.toml
+#
+# Please install dependencies using:
+#   pip install -e .[dev]
+#
+# This file is kept for backwards compatibility and will be removed in a future release.
+# See pyproject.toml [project.optional-dependencies.dev] for the current dependency list.
+
+# Development dependencies
+ruff>=0.1.0
+black>=24.0.0
+mypy>=1.0.0
+pytest>=7.4.3
+pytest-cov>=4.1.0
+pytest-asyncio>=0.21.0
+pre-commit>=3.6.0
+
+# Type stubs
+types-requests>=2.31.0
+types-python-dateutil>=2.8.19
